@@ -1,0 +1,19 @@
+services:
+  # Обновляет расписание из РУЗ каждые 6 часов (cron внутри контейнера)
+  schedule:
+    build: .
+    command: ["./schedule-entrypoint.sh"]
+    volumes:
+      - /opt/ruz-calendar/calendars:/app/calendars
+      - /opt/ruz-calendar/schedule-entrypoint.sh:/app/schedule-entrypoint.sh
+    restart: unless-stopped
+
+  # Telegram-бот для домашки
+  homework-bot:
+    build: .
+    command: ["python3", "homework-bot.py"]
+    env_file: .env
+    volumes:
+      - /opt/ruz-calendar/calendars:/app/calendars
+      - /opt/ruz-calendar/data:/app/data
+    restart: unless-stopped
