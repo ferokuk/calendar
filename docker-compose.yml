@@ -5,7 +5,6 @@ services:
     command: ["./schedule-entrypoint.sh"]
     volumes:
       - /opt/ruz-calendar/calendars:/app/calendars
-      - /opt/ruz-calendar/schedule-entrypoint.sh:/app/schedule-entrypoint.sh
     restart: unless-stopped
 
   # Telegram-бот для домашки
