@@ -44,6 +44,8 @@ log = logging.getLogger("bot")
 
 ALERT_KEY_HOMEWORK = "bot.homework"
 ALERT_KEY_RUNTIME = "bot.runtime"
+BOT_FEEDBACK_PREFIX = "⚠️ Бот:"
+LEGACY_DEADLINE_NOTE = "⚠️ дедлайн не найден в расписании"
 
 # Теги, которыми заполняется tags.json при первом запуске. Дальше он живёт
 # своей жизнью и правится через админку.
@@ -62,6 +64,10 @@ DEFAULT_TAGS = {
 _refresh_lock = asyncio.Lock()
 _homework_lock = asyncio.Lock()
 _last_failed_update_id: int | None = None
+
+
+class ScheduleLookupError(RuntimeError):
+    """Расписание нельзя использовать для вычисления «до пары»."""
 
 
 # ── Хранилище ──────────────────────────────────────────────
@@ -144,34 +150,77 @@ def find_next_lesson_date(subject: str) -> str | None:
     """Находит дату следующей пары по названию предмета."""
     if not config.SCHEDULE_JSON.exists():
         log.warning("Расписание %s ещё не сгенерировано", config.SCHEDULE_JSON.name)
-        return None
-    schedule = json.loads(config.SCHEDULE_JSON.read_text(encoding="utf-8"))
+        raise ScheduleLookupError("расписание ещё не загружено")
+    try:
+        schedule = json.loads(config.SCHEDULE_JSON.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("Расписание %s недоступно: %s",
+                    config.SCHEDULE_JSON.name, notify.describe_error(e))
+        raise ScheduleLookupError("файл расписания недоступен") from e
+    if not isinstance(schedule, list):
+        raise ScheduleLookupError("некорректный формат расписания")
     today = datetime.now(tz=config.TZ).strftime("%Y-%m-%d")
-    dates = sorted(set(
-        l["date"] for l in schedule
-        if l["discipline"] == subject and l["date"] > today
-    ))
+    try:
+        dates = sorted(set(
+            lesson["date"] for lesson in schedule
+            if lesson["discipline"] == subject and lesson["date"] > today
+        ))
+    except (KeyError, TypeError) as e:
+        raise ScheduleLookupError("некорректное содержимое расписания") from e
     return dates[0] if dates else None
 
 
 # ── Парсер постов ──────────────────────────────────────────
-def parse_post(text: str) -> dict | None:
-    """Парсит пост канала. Возвращает dict или None если формат не подходит."""
+def strip_bot_feedback(text: str) -> str:
+    """Удаляет нашу служебную ошибку перед повторным разбором поста."""
+    lines = [
+        line for line in text.splitlines()
+        if not line.strip().startswith(BOT_FEEDBACK_PREFIX)
+    ]
+    cleaned = "\n".join(lines)
+    # Совместимость с первой версией пометки, которая дописывалась в строку.
+    cleaned = re.sub(
+        rf"(?im)\s+—\s+{re.escape(LEGACY_DEADLINE_NOTE)}\s*$",
+        "",
+        cleaned,
+    )
+    return cleaned.rstrip()
+
+
+def _tags_hint(tags: dict) -> str:
+    shown = [f"#{tag}" for tag in sorted(tags)[:12]]
+    suffix = " …" if len(tags) > len(shown) else ""
+    return f" Доступные теги: {', '.join(shown)}{suffix}." if shown else ""
+
+
+def parse_post_detailed(text: str) -> tuple[dict | None, str | None]:
+    """Парсит пост и возвращает понятную пользователю причину отказа."""
+    text = strip_bot_feedback(text)
     # Убираем маркер #дз перед парсингом
     text = re.sub(r"#дз\s*", "", text, flags=re.IGNORECASE)
     lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
     if not lines:
-        return None
+        return None, (
+            "после #дз не хватает данных. Добавьте тег предмета, задание "
+            "и дедлайн, например: #дз #англ / упражнение 5 / до 05.09."
+        )
 
     tag_match = re.search(r"#(\S+)", lines[0])
     if not tag_match:
-        return None
+        tags = load_tags()
+        return None, (
+            "не указан тег предмета в первой строке. Например: #дз #англ."
+            + _tags_hint(tags)
+        )
     tag = tag_match.group(1).lower()
     tags = load_tags()
     subject = tags.get(tag)
     if not subject:
         log.warning("Неизвестный тег #%s — задание пропущено", tag)
-        return None
+        return None, (
+            f"предмет с тегом #{tag} не найден. Проверьте тег или попросите "
+            "администратора добавить его." + _tags_hint(tags)
+        )
 
     deadline = None
     deadline_line_idx = None
@@ -186,24 +235,44 @@ def parse_post(text: str) -> dict | None:
                 parsed_date = datetime(year, month, day, tzinfo=config.TZ)
             except ValueError:
                 log.warning("Некорректный дедлайн в посте: %s", line)
-                return None
+                return None, (
+                    f"дата «{line}» не существует. Укажите корректную дату: "
+                    "до ДД.ММ или до ДД.ММ.ГГГГ."
+                )
             deadline = parsed_date.strftime("%Y-%m-%d")
             deadline_line_idx = i
             break
         # "до пары" / "до следующей пары"
         if re.match(r"до\s+(следующей\s+)?пары$", line, re.IGNORECASE):
-            next_date = find_next_lesson_date(subject)
+            try:
+                next_date = find_next_lesson_date(subject)
+            except ScheduleLookupError:
+                return None, (
+                    "расписание временно недоступно, поэтому вычислить дедлайн нельзя. "
+                    "Укажите дату вручную: до ДД.ММ."
+                )
             if next_date:
                 deadline = next_date
                 deadline_line_idx = i
                 needs_date_replace = True
             else:
                 log.warning("Для предмета «%s» не нашлось будущих пар в расписании", subject)
+                return None, (
+                    f"в расписании нет будущей пары по предмету «{subject}». "
+                    "Укажите дату вручную: до ДД.ММ."
+                )
             break
+
+        if re.match(r"до(?:\s|$)", line, re.IGNORECASE):
+            log.warning("Неверный формат дедлайна в посте: %s", line)
+            return None, (
+                f"неверный формат дедлайна «{line}». Используйте: до 05.09, "
+                "до 05.09.2026 или до пары."
+            )
 
     if not deadline:
         log.warning("Дедлайн не найден в посте: %s", lines[0][:60])
-        return None
+        return None, "не указан дедлайн. Добавьте отдельную строку: до 05.09 или до пары."
 
     desc_lines = []
     for i, line in enumerate(lines):
@@ -214,6 +283,11 @@ def parse_post(text: str) -> dict | None:
         elif i != deadline_line_idx:
             desc_lines.append(line)
     description = "\n".join(desc_lines)
+    if not description:
+        return None, (
+            "не указано само задание. Добавьте описание между тегом предмета "
+            "и строкой дедлайна."
+        )
 
     return {
         "tag": tag,
@@ -221,7 +295,19 @@ def parse_post(text: str) -> dict | None:
         "description": description,
         "deadline": deadline,
         "needs_date_replace": needs_date_replace,
-    }
+    }, None
+
+
+def parse_post(text: str) -> dict | None:
+    """Совместимый интерфейс парсера для вызовов без диагностики."""
+    parsed, _ = parse_post_detailed(text)
+    return parsed
+
+
+def with_bot_feedback(text: str, error: str) -> str:
+    """Добавляет или заменяет служебную строку с ошибкой."""
+    source = strip_bot_feedback(text)
+    return f"{source}\n\n{BOT_FEEDBACK_PREFIX} {error}"
 
 
 # ── ICS генератор ─────────────────────────────────────────
@@ -271,6 +357,55 @@ async def react(post, emoji: str):
         await post.set_reaction([ReactionTypeEmoji(emoji)])
     except Exception as e:  # noqa: BLE001 — реакция необязательна, ронять обработку нельзя
         log.warning("Не удалось поставить реакцию %s: %s", repr(emoji), notify.describe_error(e))
+
+
+def post_content(post) -> str:
+    """Текст обычного поста или подпись поста с вложением."""
+    text = getattr(post, "text", None)
+    return text if text is not None else (getattr(post, "caption", None) or "")
+
+
+async def edit_post_content(post, content: str) -> None:
+    """Редактирует текст, не удаляя прикреплённый к media-посту файл."""
+    if getattr(post, "text", None) is not None:
+        await post.edit_text(content)
+    else:
+        await post.edit_caption(caption=content)
+
+
+async def reject_post(post, error: str) -> None:
+    """Пишет понятную ошибку прямо в пост и ставит отрицательную реакцию."""
+    current_text = post_content(post)
+    marked_text = with_bot_feedback(current_text, error)
+    if marked_text != current_text:
+        try:
+            await edit_post_content(post, marked_text)
+            log.info("Пост %s помечен пользовательской ошибкой: %s", post.message_id, error)
+        except Exception as e:  # noqa: BLE001 — реакцию всё равно нужно поставить
+            log.warning("Не удалось добавить пометку в пост %s: %s",
+                        post.message_id, notify.describe_error(e))
+    await react(post, "👎")
+
+
+async def normalize_valid_post(post, parsed: dict) -> None:
+    """После исправления удаляет ошибку и подставляет дату вместо «до пары»."""
+    current_text = post_content(post)
+    new_text = strip_bot_feedback(current_text)
+    if parsed.get("needs_date_replace"):
+        deadline = datetime.strptime(parsed["deadline"], "%Y-%m-%d")
+        new_text = re.sub(
+            r"(?im)^до\s+(?:следующей\s+)?пары\s*$",
+            f"до {deadline.strftime('%d.%m')}",
+            new_text,
+            count=1,
+        )
+    if new_text == current_text:
+        return
+    try:
+        await edit_post_content(post, new_text)
+    except Exception as e:  # noqa: BLE001 — данные уже сохранены, правка косметическая
+        log.warning("Не удалось очистить пометку в посте %s: %s",
+                    post.message_id, notify.describe_error(e))
 
 
 # ── Форматирование для админки ─────────────────────────────
@@ -677,16 +812,19 @@ async def cmd_deltag(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Обработчики канала ─────────────────────────────────────
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post = update.channel_post
-    if not post or not post.text:
+    if not post:
+        return
+    content = post_content(post)
+    if not content:
         return
 
     # Парсим только посты с #дз
-    if "#дз" not in post.text.lower():
+    if "#дз" not in content.lower():
         return
 
-    parsed = parse_post(post.text)
+    parsed, parse_error = parse_post_detailed(content)
     if not parsed:
-        await react(post, "👎")
+        await reject_post(post, parse_error or "не удалось разобрать сообщение.")
         return
 
     msg_id = str(post.message_id)
@@ -697,20 +835,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             await react(post, "👎")
             return
 
-    # Если "до пары" — заменяем на точную дату в посте
-    if parsed.get("needs_date_replace"):
-        dt = datetime.strptime(parsed["deadline"], "%Y-%m-%d")
-        new_text = re.sub(
-            r"до\s+(следующей\s+)?пары",
-            f"до {dt.strftime('%d.%m')}",
-            post.text,
-            flags=re.IGNORECASE,
-        )
-        try:
-            await post.edit_text(new_text)
-        except Exception as e:  # noqa: BLE001 — правка поста необязательна
-            log.warning("Не удалось отредактировать пост %s: %s",
-                        msg_id, notify.describe_error(e))
+    await normalize_valid_post(post, parsed)
 
     await react(post, "👍")
     log.info("Новое задание #%s (%s) до %s: %s",
@@ -720,11 +845,14 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_edited_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post = update.edited_channel_post
-    if not post or not post.text:
+    if not post:
+        return
+    content = post_content(post)
+    if not content:
         return
 
     msg_id = str(post.message_id)
-    if "#дз" not in post.text.lower():
+    if "#дз" not in content.lower():
         async with _homework_lock:
             homework = load_homework()
             old = homework.get(msg_id)
@@ -737,27 +865,43 @@ async def handle_edited_post(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 log.info("Задание %s удалено — из поста убран #дз", msg_id)
         return
 
-    parsed = parse_post(post.text)
+    parsed, parse_error = parse_post_detailed(content)
     if not parsed:
-        await react(post, "👎")
+        async with _homework_lock:
+            homework = load_homework()
+            if homework.pop(msg_id, None):
+                if not persist_homework(homework, f"невалидная правка задания {msg_id}"):
+                    await react(post, "👎")
+                    return
+                log.info("Задание %s удалено из календаря после невалидной правки", msg_id)
+        await reject_post(post, parse_error or "не удалось разобрать сообщение.")
         return
 
     async with _homework_lock:
         homework = load_homework()
         old = homework.get(msg_id)
         # Это фильтрует собственную правку «до пары» → дата.
-        if old and old.get("deadline") == parsed["deadline"] \
-               and old.get("description") == parsed["description"] \
-               and old.get("tag") == parsed["tag"]:
-            log.debug("Задание %s: данные не изменились, пропускаем", msg_id)
-            return
+        unchanged = bool(
+            old
+            and old.get("deadline") == parsed["deadline"]
+            and old.get("description") == parsed["description"]
+            and old.get("tag") == parsed["tag"]
+        )
+        if not unchanged:
+            homework[msg_id] = parsed
+            if not persist_homework(homework, f"правка задания {msg_id}"):
+                await react(post, "👎")
+                return
 
-        homework[msg_id] = parsed
-        if not persist_homework(homework, f"правка задания {msg_id}"):
-            await react(post, "👎")
-            return
+    await normalize_valid_post(post, parsed)
 
-    await react(post, "✍️")
+    # Реакция показывает текущее состояние поста: после исправления ошибки
+    # заменяем прежний 👎 на 👍. set_reaction заменяет реакцию этого бота.
+    await react(post, "👍")
+
+    if unchanged:
+        log.debug("Задание %s: данные не изменились, служебная пометка очищена", msg_id)
+        return
 
     changes = []
     if old and old.get("deadline") != parsed["deadline"]:
