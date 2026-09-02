@@ -1,0 +1,12 @@
+[project]
+name = "ruz-calendar"
+version = "0.1.0"
+description = "Календари расписания РУЗ и Telegram-бот для домашней работы"
+requires-python = ">=3.12"
+dependencies = [
+    "python-telegram-bot[job-queue]>=21,<22",
+    "tzdata>=2025.2",
+]
+
+[dependency-groups]
+dev = []

@@ -1,0 +1,9 @@
+.git
+.idea
+.env
+__pycache__
+*.py[cod]
+.venv
+.uv-cache
+calendars
+data
