@@ -5,8 +5,8 @@ services:
     command: ["./schedule-entrypoint.sh"]
     env_file: .env
     volumes:
-      - /opt/ruz-calendar/calendars:/app/calendars
-      - /opt/ruz-calendar/data:/app/data
+      - ./calendars:/app/calendars
+      - ./data:/app/data
     restart: unless-stopped
 
   # Telegram-бот для домашки
@@ -15,6 +15,6 @@ services:
     command: ["uv", "run", "--frozen", "--no-dev", "--no-sync", "python", "homework-bot.py"]
     env_file: .env
     volumes:
-      - /opt/ruz-calendar/calendars:/app/calendars
-      - /opt/ruz-calendar/data:/app/data
+      - ./calendars:/app/calendars
+      - ./data:/app/data
     restart: unless-stopped
