@@ -555,6 +555,8 @@ def screen_schedule() -> tuple[str, InlineKeyboardMarkup]:
             f"Шаг: {esc(sched.get('last_error_step', '—'))}",
             f"<code>{esc(sched['last_error'])}</code>",
         ]
+    if sched.get("next_retry_at"):
+        lines.append(f"🔄 Автоповтор после: {esc(status.human_time(sched['next_retry_at']))}")
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Обновить сейчас", callback_data="sched:refresh")],
@@ -731,7 +733,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 notice = (f"✅ Обновлено: занятий {summary['lessons']} "
                           f"за {summary['duration_sec']} с")
             except Exception as e:  # noqa: BLE001 — текст ошибки нужен на экране
-                notice = f"🔴 Не удалось: {esc(notify.describe_error(e))}"
+                notice = (f"🔴 Не удалось: {esc(notify.describe_error(e))}\n"
+                          "Обновление повторится автоматически в фоне.")
             await show(update, "sched", notice=notice)
         return
 

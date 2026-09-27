@@ -6,6 +6,7 @@
 админке бота, поэтому вся работа собрана в импортируемой функции run().
 """
 
+import argparse
 import http.client
 import json
 import logging
@@ -68,7 +69,7 @@ class InvalidResponseError(ValueError):
 
 
 @contextmanager
-def _update_lock():
+def _update_lock(*, blocking: bool = True):
     """Не даёт cron и кнопке админки обновлять одни файлы одновременно."""
     lock_path = config.DATA_DIR / "schedule-update.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,9 +79,14 @@ def _update_lock():
         except ImportError:  # pragma: no cover — локальный запуск на Windows
             fcntl = None
         if fcntl:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            try:
+                fcntl.flock(lock_file.fileno(), flags)
+            except BlockingIOError:
+                yield False
+                return
         try:
-            yield
+            yield True
         finally:
             if fcntl:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -175,30 +181,6 @@ def fetch_schedule(group_id: int, start: datetime, finish: datetime) -> list[dic
 
 
 # ── Преобразование ─────────────────────────────────────────
-def filter_subgroups(lessons: list[dict]) -> list[dict]:
-    """
-    Оставляет только свою подгруппу.
-
-    MARKER помечает пары, которые вообще делятся на подгруппы; всё остальное
-    проходит без проверки. Пустой FILTER отключает фильтрацию целиком.
-    """
-    if not config.SUBGROUP_FILTER:
-        return lessons
-
-    marker = config.SUBGROUP_MARKER or config.SUBGROUP_FILTER
-    result = []
-    for lesson in lessons:
-        group = lesson.get("group") or ""
-        if marker in group and config.SUBGROUP_FILTER not in group:
-            continue
-        result.append(lesson)
-
-    dropped = len(lessons) - len(result)
-    if dropped:
-        log.info("Фильтр подгруппы «%s»: отброшено пар — %d", config.SUBGROUP_FILTER, dropped)
-    return result
-
-
 def classify(kind_of_work: str) -> str:
     low = kind_of_work.lower()
     for substr, cal in CALENDAR_MAP.items():
@@ -208,8 +190,25 @@ def classify(kind_of_work: str) -> str:
 
 
 def make_uid(lesson: dict) -> str:
-    lesson_id = lesson.get("lessonOid") or lesson.get("lessonId") or lesson.get("discipline", "")
-    raw = f"{lesson_id}-{lesson['date']}-{lesson['beginLesson']}"
+    """Стабильный UID занятия, включая параллельные занятия разных подгрупп."""
+    lesson_id = lesson.get("lessonOid") or lesson.get("lessonId")
+    group = (lesson.get("group") or "").strip()
+    if lesson_id and not group:
+        # Сохраняем старые UID там, где нет группового идентификатора.
+        raw = f"{lesson_id}-{lesson['date']}-{lesson['beginLesson']}"
+    else:
+        # РУЗ может повторять lessonOid у разных подгрупп. Группа входит в UID
+        # всегда, чтобы исчезновение соседней подгруппы не меняло его.
+        # Без lessonOid/lessonId различаем дисциплины по ID или названию:
+        # разные предметы в одном слоте не должны поглощать друг друга.
+        # Преподаватель и аудитория в идентификатор не входят.
+        raw = json.dumps([
+            str(lesson_id) if lesson_id else None,
+            str(lesson.get("disciplineOid") or lesson.get("disciplineId")
+                or lesson.get("discipline") or "")
+            if not lesson_id else "",
+            lesson["date"], lesson["beginLesson"], group,
+        ], ensure_ascii=False, separators=(",", ":"))
     return md5(raw.encode()).hexdigest() + "@ruz.fa.ru"
 
 
@@ -232,7 +231,12 @@ def build_ics(calendar_name: str, events: list[dict]) -> str:
         f"X-WR-CALNAME:{CALENDAR_NAMES.get(calendar_name, calendar_name)}",
     ]
 
+    seen_uids: set[str] = set()
     for ev in events:
+        uid = make_uid(ev)
+        if uid in seen_uids:
+            continue
+        seen_uids.add(uid)
         location_parts = []
         if ev.get("auditorium"):
             location_parts.append(ev["auditorium"])
@@ -243,6 +247,8 @@ def build_ics(calendar_name: str, events: list[dict]) -> str:
         description_parts = []
         if ev.get("kindOfWork"):
             description_parts.append(ev["kindOfWork"])
+        if ev.get("group"):
+            description_parts.append(f"Группа: {ev['group']}")
         lecturer_name = ev.get("lecturer_title") or ev.get("lecturer")
         if lecturer_name:
             description_parts.append(f"Преподаватель: {lecturer_name}")
@@ -253,7 +259,7 @@ def build_ics(calendar_name: str, events: list[dict]) -> str:
 
         lines.extend([
             "BEGIN:VEVENT",
-            f"UID:{make_uid(ev)}",
+            f"UID:{uid}",
             f"DTSTAMP:{datetime.now(tz=timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
             f"DTSTART:{ics_dt_utc(ev['date'], ev['beginLesson'])}",
             f"DTEND:{ics_dt_utc(ev['date'], ev['endLesson'])}",
@@ -296,6 +302,13 @@ def publish_files(files: dict[Path, str]) -> None:
 def _fail(step: str, error: BaseException, attempts: int | None = None) -> ScheduleError:
     """Пишет статус, уведомляет админа и возвращает исключение для raise."""
     reason = notify.describe_error(error)
+    previous_failures = status.read("schedule").get("consecutive_failures")
+    failures = previous_failures + 1 if isinstance(previous_failures, int) and previous_failures >= 0 else 1
+    delay = min(
+        config.SCHEDULE_RETRY_SECONDS * (2 ** min(failures - 1, 20)),
+        config.SCHEDULE_RETRY_MAX_SECONDS,
+    )
+    retry_at = (datetime.now(tz=config.TZ) + timedelta(seconds=delay)).isoformat(timespec="seconds")
     status.update(
         "schedule",
         last_error=reason,
@@ -303,13 +316,17 @@ def _fail(step: str, error: BaseException, attempts: int | None = None) -> Sched
         last_error_at=status.now_iso(),
         last_run_finished=status.now_iso(),
         attempts=attempts,
+        in_progress=False,
+        consecutive_failures=failures,
+        next_retry_at=retry_at,
     )
+    log.warning("Обновление не удалось; фоновый повтор после %s (сбой подряд: %d)", retry_at, failures)
     notify.alert(
         "Расписание не обновилось",
         reason,
         step=step,
         attempts=attempts,
-        extra={"Группа": config.RUZ_GROUP_ID},
+        extra={"Группа": config.RUZ_GROUP_ID, "Автоматический повтор после": retry_at},
         key=ALERT_KEY,
     )
     if isinstance(error, ScheduleError):
@@ -328,14 +345,17 @@ def _run() -> dict:
     period = f"{today.strftime('%d.%m.%Y')} — {finish.strftime('%d.%m.%Y')}"
 
     log.info("Обновление расписания: группа %s, период %s", config.RUZ_GROUP_ID, period)
-    status.update("schedule", last_run_started=status.now_iso())
+    status.update("schedule", last_run_started=status.now_iso(), in_progress=True, next_retry_at=None)
 
     try:
         lessons = fetch_schedule(config.RUZ_GROUP_ID, today, finish)
     except ScheduleError as e:
         raise _fail(e.step or "скачивание расписания", e, e.attempts) from e
 
-    lessons = filter_subgroups(lessons)
+    unique_lessons: dict[str, dict] = {}
+    for lesson in lessons:
+        unique_lessons.setdefault(make_uid(lesson), lesson)
+    lessons = list(unique_lessons.values())
     log.info("Всего занятий за период: %d", len(lessons))
 
     calendars: dict[str, list[dict]] = {}
@@ -384,7 +404,11 @@ def _run() -> dict:
         last_run_finished=status.now_iso(),
         last_error=None,
         last_error_step=None,
+        last_error_at=None,
         attempts=None,
+        in_progress=False,
+        consecutive_failures=0,
+        next_retry_at=None,
         **summary,
     )
     notify.recovered(ALERT_KEY, "Расписание снова обновляется")
@@ -394,18 +418,53 @@ def _run() -> dict:
     return summary
 
 
-def run() -> dict:
+def _retry_due() -> bool:
+    """Проверяется под блокировкой: незавершённый запуск можно безопасно повторить."""
+    state = status.read("schedule")
+    if state.get("in_progress"):
+        return True
+    retry_at = state.get("next_retry_at")
+    if retry_at:
+        try:
+            moment = datetime.fromisoformat(retry_at)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=config.TZ)
+            return datetime.now(tz=config.TZ) >= moment
+        except (TypeError, ValueError):
+            log.warning("Некорректное время фонового повтора: %r", retry_at)
+    # Старые статусы ещё не содержат next_retry_at/in_progress.
+    started = state.get("last_run_started") or ""
+    finished = state.get("last_run_finished") or ""
+    unfinished = isinstance(started, str) and isinstance(finished, str) and started > finished
+    return bool(state.get("last_error") or not state.get("last_success") or unfinished)
+
+
+def run(*, retry_only: bool = False, background: bool = False) -> dict | None:
     """Запускает обновление и гарантирует статус/алерт для любой ошибки."""
     try:
-        with _update_lock():
-            return _run()
+        with _update_lock(blocking=not (retry_only or background)) as acquired:
+            if not acquired:
+                log.info("Обновление уже идёт; фоновый запуск пропущен")
+                return None
+            if retry_only and not _retry_due():
+                return None
+            try:
+                return _run()
+            except ScheduleError:
+                raise
+            except Exception as e:
+                # Состояние ошибки тоже записываем до освобождения блокировки.
+                raise _fail("обработка расписания", e) from e
     except ScheduleError:
         raise
     except Exception as e:  # noqa: BLE001 — run() вызывается напрямую из бота
         raise _fail("обработка расписания", e) from e
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Обновление календарей РУЗ")
+    parser.add_argument("--retry", action="store_true", help="повторить только неудавшееся обновление, если пора")
+    args = parser.parse_args(argv)
     logs.setup("schedule")
     try:
         config.check()
@@ -417,7 +476,7 @@ def main() -> None:
     notify.recovered("schedule.config", "Конфигурация расписания исправлена")
 
     try:
-        run()
+        run(retry_only=args.retry, background=True)
     except ScheduleError:
         sys.exit(1)
     except Exception as e:  # noqa: BLE001 — падение крона не должно остаться незамеченным

@@ -54,7 +54,11 @@ def _read_all() -> dict:
 
 
 def read(component: str) -> dict:
-    return _read_all().get(component, {})
+    state = _read_all().get(component, {})
+    if not isinstance(state, dict):
+        log.warning("Некорректная секция %s в %s: ожидался объект", component, config.STATUS_JSON.name)
+        return {}
+    return state
 
 
 def update(component: str, **fields) -> dict:

@@ -26,12 +26,14 @@ uv run --frozen --no-dev --no-sync python /app/cron-runner.py --snapshot
 
 # Настраиваем cron. Расписание уже проверено config.py при первом запуске.
 # У cron урезанный PATH (/usr/bin:/bin), в котором нет /usr/local/bin,
-# поэтому подставляем абсолютный путь к python3 на этапе генерации crontab.
+# поэтому подставляем абсолютный путь к uv на этапе генерации crontab.
 CRON_EXPRESSION="${SCHEDULE_CRON:-0 */6 * * *}"
 UV_BIN="$(command -v uv)"
 {
     echo "TZ=${TZ:-Europe/Moscow}"
     echo "$CRON_EXPRESSION cd /app && $UV_BIN run --frozen --no-dev --no-sync python /app/cron-runner.py >> /proc/1/fd/1 2>&1"
+    # Проверяем отложенные повторы каждую минуту; время повтора хранится в статусе.
+    echo "* * * * * cd /app && $UV_BIN run --frozen --no-dev --no-sync python /app/cron-runner.py --retry >> /proc/1/fd/1 2>&1"
 } | crontab -
 
 # Запускаем cron на переднем плане

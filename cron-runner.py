@@ -24,7 +24,7 @@ def run() -> None:
     # читает и валидирует env при импорте.
     import ruz_schedule
 
-    ruz_schedule.main()
+    ruz_schedule.main(sys.argv[1:])
 
 
 if __name__ == "__main__":

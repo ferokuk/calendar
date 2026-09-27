@@ -145,17 +145,16 @@ RUZ_API_URL = _str("RUZ_API_URL", "https://ruz.fa.ru/api/schedule/group")
 RUZ_DAYS_AHEAD = _int("RUZ_DAYS_AHEAD", 60, minimum=1, maximum=365)
 RUZ_CHUNK_DAYS = _int("RUZ_CHUNK_DAYS", 7, minimum=1, maximum=60)
 
-# Подгруппы: MARKER помечает пары, которые вообще делятся на подгруппы,
-# FILTER — какая из них твоя. Пустой FILTER отключает фильтрацию целиком.
-SUBGROUP_MARKER = _str("SUBGROUP_MARKER", "")
-SUBGROUP_FILTER = _str("SUBGROUP_FILTER", "")
-
 HTTP_TIMEOUT = _float("HTTP_TIMEOUT", 15.0, minimum=1.0)
 HTTP_RETRIES = _int("HTTP_RETRIES", 4, minimum=1, maximum=20)
 HTTP_BACKOFF = _float("HTTP_BACKOFF", 3.0, minimum=0.0)
 HTTP_BACKOFF_MAX = _float("HTTP_BACKOFF_MAX", 60.0, minimum=1.0)
 FETCH_DELAY = _float("FETCH_DELAY", 1.0, minimum=0.0)
 SCHEDULE_CRON = _cron("SCHEDULE_CRON", "0 */6 * * *")
+SCHEDULE_RETRY_SECONDS = _int("SCHEDULE_RETRY_SECONDS", 60, minimum=60, maximum=86400)
+SCHEDULE_RETRY_MAX_SECONDS = _int("SCHEDULE_RETRY_MAX_SECONDS", 900, minimum=60, maximum=86400)
+if SCHEDULE_RETRY_MAX_SECONDS < SCHEDULE_RETRY_SECONDS:
+    _errors.append("SCHEDULE_RETRY_MAX_SECONDS не может быть меньше SCHEDULE_RETRY_SECONDS")
 
 # ── Домашка ────────────────────────────────────────────────
 HOMEWORK_RETENTION_DAYS = _int("HOMEWORK_RETENTION_DAYS", 14, minimum=0)
