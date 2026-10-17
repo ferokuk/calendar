@@ -45,6 +45,18 @@ CALENDAR_MAP = {
 }
 DEFAULT_CALENDAR = "other"
 
+# Защита от пустых или урезанных ответов РУЗ: если впереди было хотя бы
+# GUARD_MIN_LESSONS занятий, а пришло меньше GUARD_MIN_RATIO от них,
+# опубликованные календари не трогаем до подтверждения в админке.
+GUARD_MIN_LESSONS = 10
+GUARD_MIN_RATIO = 0.5
+
+# Что из занятия РУЗ нужно боту: «до пары», время и аудитория контрольной
+SCHEDULE_JSON_FIELDS = (
+    "discipline", "date", "beginLesson", "endLesson",
+    "kindOfWork", "auditorium", "building", "group",
+)
+
 CALENDAR_NAMES = {
     "lectures":      "Лекции",
     "seminars":      "Семинары",
@@ -161,7 +173,7 @@ def fetch_schedule(group_id: int, start: datetime, finish: datetime) -> list[dic
 
     while current <= finish:
         chunk_end = min(current + timedelta(days=config.RUZ_CHUNK_DAYS - 1), finish)
-        label = f"неделя {current.strftime('%d.%m')} — {chunk_end.strftime('%d.%m')}"
+        label = f"период {current.strftime('%d.%m')} — {chunk_end.strftime('%d.%m')}"
         url = (
             f"{config.RUZ_API_URL}/{group_id}"
             f"?start={current.strftime('%Y.%m.%d')}"
@@ -221,6 +233,11 @@ def escape_ics(text: str) -> str:
     return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
+def lesson_location(lesson: dict) -> str:
+    """«В4/3505, 4-й Вешняковский проезд, 4» — аудитория и здание занятия."""
+    return ", ".join(part for part in (lesson.get("auditorium"), lesson.get("building")) if part)
+
+
 def build_ics(calendar_name: str, events: list[dict]) -> str:
     lines = [
         "BEGIN:VCALENDAR",
@@ -237,12 +254,7 @@ def build_ics(calendar_name: str, events: list[dict]) -> str:
         if uid in seen_uids:
             continue
         seen_uids.add(uid)
-        location_parts = []
-        if ev.get("auditorium"):
-            location_parts.append(ev["auditorium"])
-        if ev.get("building"):
-            location_parts.append(ev["building"])
-        location = ", ".join(location_parts)
+        location = lesson_location(ev)
 
         description_parts = []
         if ev.get("kindOfWork"):
@@ -298,8 +310,44 @@ def publish_files(files: dict[Path, str]) -> None:
                 pass
 
 
+def find_sharp_drop(previous: list, lessons: list[dict], start: str, finish: str) -> tuple[int, int] | None:
+    """
+    Сравнивает будущие занятия прошлой публикации и нового ответа РУЗ.
+
+    Окно — с `start` до конца прошлых данных, но не дальше `finish`: дни,
+    которых раньше не скачивали, сравнивать не с чем. Возвращает (было, стало),
+    если занятий подозрительно мало, иначе None.
+    """
+    previous_dates = [
+        item["date"] for item in previous
+        if isinstance(item, dict) and isinstance(item.get("date"), str) and item["date"] >= start
+    ]
+    if not previous_dates:
+        return None
+    window_end = min(finish, max(previous_dates))
+    before = sum(1 for d in previous_dates if d <= window_end)
+    after = sum(1 for lesson in lessons if start <= lesson["date"] <= window_end)
+    if before >= GUARD_MIN_LESSONS and after < before * GUARD_MIN_RATIO:
+        return before, after
+    return None
+
+
+def _previous_lessons() -> list:
+    """Прошлая публикация schedule.json; пустой список, если её нет или она битая."""
+    try:
+        data = json.loads(config.SCHEDULE_JSON.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        log.warning("Прошлый %s не прочитан, сравнение объёма пропущено: %s",
+                    config.SCHEDULE_JSON.name, notify.describe_error(e))
+        return []
+    return data if isinstance(data, list) else []
+
+
 # ── Запуск ─────────────────────────────────────────────────
-def _fail(step: str, error: BaseException, attempts: int | None = None) -> ScheduleError:
+def _fail(step: str, error: BaseException, attempts: int | None = None,
+          extra: dict | None = None) -> ScheduleError:
     """Пишет статус, уведомляет админа и возвращает исключение для raise."""
     reason = notify.describe_error(error)
     previous_failures = status.read("schedule").get("consecutive_failures")
@@ -326,7 +374,8 @@ def _fail(step: str, error: BaseException, attempts: int | None = None) -> Sched
         reason,
         step=step,
         attempts=attempts,
-        extra={"Группа": config.RUZ_GROUP_ID, "Автоматический повтор после": retry_at},
+        extra={"Группа": config.RUZ_GROUP_ID, **(extra or {}),
+               "Автоматический повтор после": retry_at},
         key=ALERT_KEY,
     )
     if isinstance(error, ScheduleError):
@@ -334,21 +383,25 @@ def _fail(step: str, error: BaseException, attempts: int | None = None) -> Sched
     return ScheduleError(reason, step=step, attempts=attempts)
 
 
-def _run() -> dict:
+def _run(*, force: bool = False) -> dict:
     """
     Полный цикл обновления. Возвращает сводку, бросает ScheduleError при неудаче
     (статус и уведомление к этому моменту уже записаны).
+
+    `force` публикует расписание, даже если занятий стало подозрительно мало.
     """
     started_at = time.monotonic()
     today = datetime.now(tz=config.TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    # Прошлые пары остаются в календарях SCHEDULE_HISTORY_DAYS дней
+    start = today - timedelta(days=config.SCHEDULE_HISTORY_DAYS)
     finish = today + timedelta(days=config.RUZ_DAYS_AHEAD)
-    period = f"{today.strftime('%d.%m.%Y')} — {finish.strftime('%d.%m.%Y')}"
+    period = f"{start.strftime('%d.%m.%Y')} — {finish.strftime('%d.%m.%Y')}"
 
     log.info("Обновление расписания: группа %s, период %s", config.RUZ_GROUP_ID, period)
     status.update("schedule", last_run_started=status.now_iso(), in_progress=True, next_retry_at=None)
 
     try:
-        lessons = fetch_schedule(config.RUZ_GROUP_ID, today, finish)
+        lessons = fetch_schedule(config.RUZ_GROUP_ID, start, finish)
     except ScheduleError as e:
         raise _fail(e.step or "скачивание расписания", e, e.attempts) from e
 
@@ -357,6 +410,24 @@ def _run() -> dict:
         unique_lessons.setdefault(make_uid(lesson), lesson)
     lessons = list(unique_lessons.values())
     log.info("Всего занятий за период: %d", len(lessons))
+
+    drop = find_sharp_drop(
+        _previous_lessons(), lessons, today.strftime("%Y-%m-%d"), finish.strftime("%Y-%m-%d")
+    )
+    if drop and not force:
+        before, after = drop
+        status.update("schedule", guard_blocked=True, guard_before=before, guard_after=after)
+        raise _fail(
+            "проверка объёма расписания",
+            ScheduleError("РУЗ вернул подозрительно мало занятий, календари оставлены как были"),
+            extra={
+                "Занятий впереди было": before,
+                "Пришло": after,
+                "Если так и должно быть": "админка → 🗓 Расписание → «Опубликовать как есть»",
+            },
+        )
+    if drop:
+        log.warning("Занятий стало заметно меньше (%d → %d), публикую по подтверждению", *drop)
 
     calendars: dict[str, list[dict]] = {}
     for lesson in lessons:
@@ -369,8 +440,8 @@ def _run() -> dict:
         config.CALENDARS_DIR.mkdir(parents=True, exist_ok=True)
 
         schedule_data = [
-            {"discipline": l["discipline"], "date": l["date"], "beginLesson": l["beginLesson"]}
-            for l in lessons
+            {field: l.get(field) for field in SCHEDULE_JSON_FIELDS}
+            for l in sorted(lessons, key=lambda e: (e["date"], e["beginLesson"]))
         ]
         output_files = {
             config.SCHEDULE_JSON: json.dumps(schedule_data, ensure_ascii=False),
@@ -409,6 +480,9 @@ def _run() -> dict:
         in_progress=False,
         consecutive_failures=0,
         next_retry_at=None,
+        guard_blocked=False,
+        guard_before=None,
+        guard_after=None,
         **summary,
     )
     notify.recovered(ALERT_KEY, "Расписание снова обновляется")
@@ -439,7 +513,8 @@ def _retry_due() -> bool:
     return bool(state.get("last_error") or not state.get("last_success") or unfinished)
 
 
-def run(*, retry_only: bool = False, background: bool = False) -> dict | None:
+def run(*, retry_only: bool = False, background: bool = False,
+        force: bool = False) -> dict | None:
     """Запускает обновление и гарантирует статус/алерт для любой ошибки."""
     try:
         with _update_lock(blocking=not (retry_only or background)) as acquired:
@@ -449,7 +524,7 @@ def run(*, retry_only: bool = False, background: bool = False) -> dict | None:
             if retry_only and not _retry_due():
                 return None
             try:
-                return _run()
+                return _run(force=force)
             except ScheduleError:
                 raise
             except Exception as e:

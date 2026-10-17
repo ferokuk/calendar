@@ -135,6 +135,8 @@ CALENDARS_DIR = _path("CALENDARS_DIR", "/app/calendars")
 TG_BOT_TOKEN = _str("TG_BOT_TOKEN", required=True, hint="токен бота от @BotFather")
 ADMIN_CHAT_ID = _int("ADMIN_CHAT_ID", required=True,
                      hint="твой Telegram user id, узнать можно у @userinfobot")
+# Пустое значение — принимать посты из любого канала, где бот админ
+HOMEWORK_CHANNEL_ID = _int("HOMEWORK_CHANNEL_ID")
 ALERTS_ENABLED = _bool("ALERTS_ENABLED", True)
 ALERT_COOLDOWN_MINUTES = _int("ALERT_COOLDOWN_MINUTES", 60, minimum=0)
 
@@ -143,7 +145,8 @@ RUZ_GROUP_ID = _int("RUZ_GROUP_ID", required=True,
                     hint="id группы в ruz.fa.ru, виден в адресе страницы расписания")
 RUZ_API_URL = _str("RUZ_API_URL", "https://ruz.fa.ru/api/schedule/group")
 RUZ_DAYS_AHEAD = _int("RUZ_DAYS_AHEAD", 60, minimum=1, maximum=365)
-RUZ_CHUNK_DAYS = _int("RUZ_CHUNK_DAYS", 7, minimum=1, maximum=60)
+SCHEDULE_HISTORY_DAYS = _int("SCHEDULE_HISTORY_DAYS", 30, minimum=0, maximum=365)
+RUZ_CHUNK_DAYS = _int("RUZ_CHUNK_DAYS", 31, minimum=1, maximum=60)
 
 HTTP_TIMEOUT = _float("HTTP_TIMEOUT", 15.0, minimum=1.0)
 HTTP_RETRIES = _int("HTTP_RETRIES", 4, minimum=1, maximum=20)
@@ -165,6 +168,7 @@ HOMEWORK_JSON = DATA_DIR / "homework.json"
 TAGS_JSON = DATA_DIR / "tags.json"
 ALERTS_JSON = DATA_DIR / "alerts.json"
 STATUS_JSON = DATA_DIR / "status.json"
+DISCUSSION_JSON = DATA_DIR / "discussion.json"
 SCHEDULE_JSON = CALENDARS_DIR / "schedule.json"
 HOMEWORK_ICS = CALENDARS_DIR / "homework.ics"
 

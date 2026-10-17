@@ -126,10 +126,14 @@ def send(text: str) -> bool:
 # ── Алерты ─────────────────────────────────────────────────
 def alert(title: str, error: BaseException | str, *, step: str = "",
           attempts: int | None = None, extra: dict | None = None,
-          key: str | None = None) -> bool:
+          key: str | None = None, sticky: bool = True) -> bool:
     """
     Сообщает об ошибке. `key` определяет, что считать «той же самой» ошибкой
     для кулдауна и для последующего recovered().
+
+    `sticky=False` — разовое событие (упала обработка одного сообщения):
+    повторы так же гасятся кулдауном, но состояние «сломано» не заводится
+    и «восстановилось» потом не приходит.
     """
     if not config.ALERTS_ENABLED:
         return False
@@ -140,7 +144,7 @@ def alert(title: str, error: BaseException | str, *, step: str = "",
         state = _load_state()
         entry = state.get(key, {})
 
-        if entry.get("active") and entry.get("error") == error_text:
+        if (entry.get("active") or not sticky) and entry.get("error") == error_text:
             last_sent = entry.get("last_sent")
             if last_sent and _within_cooldown(last_sent):
                 entry["suppressed"] = entry.get("suppressed", 0) + 1
@@ -168,7 +172,7 @@ def alert(title: str, error: BaseException | str, *, step: str = "",
 
         sent = send("\n".join(lines))
         state[key] = {
-            "active": True,
+            "active": sticky,
             "error": error_text,
             "last_sent": status_now() if sent else entry.get("last_sent"),
             "last_seen": status_now(),
