@@ -163,6 +163,17 @@ def test_post_kind_detects_markers():
     assert bot.post_kind("#дзшка в чате") is None
 
 
+def test_post_kind_ignores_markers_outside_first_line():
+    announcement = (
+        "обновление бота 🤖\n\n"
+        "контрольные теперь отдельно от дз — через #кр\n"
+        "#кр #модбп\nпишем на листочках\nна 29.10, 1 пара"
+    )
+
+    assert bot.post_kind(announcement) is None
+    assert bot.post_kind("\n#англ #дз\nупр\nдо 05.11") == "homework"
+
+
 def test_post_kind_ignores_marker_inside_bot_feedback():
     text = "просто пост\n\n⚠️ Бот: не указан тег. Например: #дз #англ."
 

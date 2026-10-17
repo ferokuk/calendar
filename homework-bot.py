@@ -401,10 +401,15 @@ def strip_bot_feedback(text: str) -> str:
 
 
 def post_kind(text: str) -> str | None:
-    """«homework», «control», «conflict» (оба маркера) или None — пост не для бота."""
-    text = strip_bot_feedback(text)
-    homework = bool(HOMEWORK_MARKER.search(text))
-    control = bool(CONTROL_MARKER.search(text))
+    """
+    «homework», «control», «conflict» (оба маркера) или None — пост не для бота.
+
+    Маркер ищется только в первой строке: так задуман формат, а анонсы и
+    обсуждения, где #дз/#кр упоминаются в тексте, бот не трогает.
+    """
+    first_line = next((line for line in strip_bot_feedback(text).splitlines() if line.strip()), "")
+    homework = bool(HOMEWORK_MARKER.search(first_line))
+    control = bool(CONTROL_MARKER.search(first_line))
     if homework and control:
         return "conflict"
     if control:
@@ -801,10 +806,10 @@ def generate_ics(homework: dict):
 
 
 # ── Реакции ────────────────────────────────────────────────
-async def react(post, emoji: str):
-    """Ставит реакцию на пост канала."""
+async def react(post, emoji: str | None):
+    """Ставит реакцию на пост канала; None снимает реакцию бота."""
     try:
-        await post.set_reaction([ReactionTypeEmoji(emoji)])
+        await post.set_reaction([ReactionTypeEmoji(emoji)] if emoji else [])
     except Exception as e:  # noqa: BLE001 — реакция необязательна, ронять обработку нельзя
         log.warning("Не удалось поставить реакцию %s: %s", repr(emoji), notify.describe_error(e))
 
@@ -1444,6 +1449,17 @@ async def handle_edited_post(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     return
                 await react(post, "👌")
                 log.info("Запись %s удалена — из поста убран #дз/#кр", msg_id)
+                return
+        # Пост не для бота, но несёт нашу старую пометку об ошибке — убираем её и 👎
+        if BOT_FEEDBACK_PREFIX in content:
+            cleaned = strip_bot_feedback(post_html(post))
+            try:
+                await edit_post_content(post, cleaned)
+            except Exception as e:  # noqa: BLE001 — пометка косметическая
+                log.warning("Не удалось убрать пометку из поста %s: %s",
+                            post.message_id, notify.describe_error(e))
+            await react(post, None)
+            log.info("Пост %s больше не для бота — пометка и реакция сняты", msg_id)
         return
 
     parsed, parse_error = parse_post_detailed(content, posted_on=post_day(post))

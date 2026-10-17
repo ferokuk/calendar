@@ -38,7 +38,7 @@ class FakePost:
         self.edits.append((caption, kwargs))
 
     async def set_reaction(self, reactions):
-        self.reactions.append(reactions[0].emoji)
+        self.reactions.append(reactions[0].emoji if reactions else None)
 
 
 class FakeBot:
@@ -142,6 +142,26 @@ def test_post_from_allowed_channel_is_saved_with_chat(schedule, monkeypatch):
     assert record["start"] == "20:30"
     assert record["chat_id"] == CHANNEL_ID
     assert post.reactions == ["👍"]
+
+
+def test_announcement_mentioning_markers_is_left_alone(schedule):
+    post = FakePost("обновление бота\n\nконтрольные теперь через #кр\n#кр #модбп\nна 29.10")
+
+    asyncio.run(bot.handle_channel_post(SimpleNamespace(channel_post=post), SimpleNamespace()))
+
+    assert post.edits == []
+    assert post.reactions == []
+
+
+def test_edited_non_homework_post_loses_bot_feedback_and_reaction(schedule):
+    text = ("обновление бота\n\nконтрольные теперь через #кр\n\n"
+            "⚠️ Бот: не указан тег предмета в первой строке. Например: #кр #англ.")
+    post = FakePost(text)
+
+    asyncio.run(bot.handle_edited_post(SimpleNamespace(edited_channel_post=post), SimpleNamespace()))
+
+    assert post.edits[0][0] == "обновление бота\n\nконтрольные теперь через #кр"
+    assert post.reactions == [None]
 
 
 def test_edit_comment_replies_to_discussion_copy(schedule, monkeypatch):
